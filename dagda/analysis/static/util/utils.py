@@ -40,6 +40,7 @@ def extract_filesystem_bundle(docker_driver, container_id=None, image_name=None)
     with open(temporary_dir + "/" + name + ".tar", "wb") as file:
         for chunk in image:
             file.write(chunk)
+    file.close()
     # Untar filesystem bundle
     tarfile = TarFile(temporary_dir + "/" + name + ".tar")
     tarfile.extractall(temporary_dir)
