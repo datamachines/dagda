@@ -1,5 +1,35 @@
 version: '2'
 services:
+  postgres:
+    container_name: clair_postgres
+    image: postgres:latest
+    restart: unless-stopped
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - mdb 
+
+  clair:
+    container_name: clair_clair
+    image: quay.io/coreos/clair:v2.0.8
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "6060-6061:6060-6061"
+    networks:
+      - mdb 
+    links:
+      - postgres
+    depends_on:
+      - postgres
+    volumes:
+      - /tmp:/tmp
+      - ./clair_config:/config
+    command: [-config, /config/config.yaml]
+
   dagda:
     build: .
     image: 3grander/dagda:0.8.0

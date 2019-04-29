@@ -21,6 +21,8 @@ import datetime
 import requests
 import json
 import traceback
+import subprocess
+from subprocess import check_output
 from threading import Thread
 from analysis.static.os import os_info_extractor
 from analysis.static.dependencies import dep_info_extractor
@@ -59,42 +61,50 @@ class Analyzer:
         # -- Static analysis
         image_name = self.dockerDriver.get_docker_image_name_by_container_id(container_id) if container_id \
                                                                                            else image_name
+    
+        #call klar to get result
+        
         os_packages = []
         malware_binaries = []
         dependencies = []
         temp_dir = None
+        vulnerabilities = []
         try:
             # Get OS packages
-            if InternalServer.is_debug_logging_enabled():
-                DagdaLogger.get_logger().debug('Retrieving OS packages from the docker image ...')
-
-            if container_id is None:  # Scans the docker image
-                os_packages = os_info_extractor.get_soft_from_docker_image(docker_driver=self.dockerDriver,
-                                                                           image_name=image_name)
-                temp_dir = extract_filesystem_bundle(docker_driver=self.dockerDriver,
-                                                     image_name=image_name)
-            else:  # Scans the docker container
-                os_packages = os_info_extractor.get_soft_from_docker_container_id(docker_driver=self.dockerDriver,
-                                                                                  container_id=container_id)
-                temp_dir = extract_filesystem_bundle(docker_driver=self.dockerDriver,
-                                                     container_id=container_id)
-
-            if InternalServer.is_debug_logging_enabled():
-                DagdaLogger.get_logger().debug('OS packages from the docker image retrieved')
+#             if InternalServer.is_debug_logging_enabled():
+#                 DagdaLogger.get_logger().debug('Retrieving OS packages from the docker image ...')
+# 
+#             if container_id is None:  # Scans the docker image
+#                 os_packages = os_info_extractor.get_soft_from_docker_image(docker_driver=self.dockerDriver,
+#                                                                            image_name=image_name)
+#                 temp_dir = extract_filesystem_bundle(docker_driver=self.dockerDriver,
+#                                                      image_name=image_name)
+#             else:  # Scans the docker container
+#                 os_packages = os_info_extractor.get_soft_from_docker_container_id(docker_driver=self.dockerDriver,
+#                                                                                   container_id=container_id)
+#                 temp_dir = extract_filesystem_bundle(docker_driver=self.dockerDriver,
+#                                                      container_id=container_id)
+# 
+#             if InternalServer.is_debug_logging_enabled():
+#                 DagdaLogger.get_logger().debug('OS packages from the docker image retrieved')
 
             # Get malware binaries in a parallel way
+            temp_dir = extract_filesystem_bundle(docker_driver=self.dockerDriver,
+                                                      image_name=image_name)
             malware_thread = Thread(target=Analyzer._threaded_malware, args=(self.dockerDriver, temp_dir,
                                                                              malware_binaries))
             malware_thread.start()
-
+            vuln_thread = Thread(target=Analyzer._threaded_klar, args=( image_name, vulnerabilities))
+            vuln_thread.start()
             # Get programming language dependencies in a parallel way
-            dependencies_thread = Thread(target=Analyzer._threaded_dependencies, args=(self.dockerDriver, image_name,
-                                                                                       temp_dir, dependencies))
-            dependencies_thread.start()
+            #dependencies_thread = Thread(target=Analyzer._threaded_dependencies, args=(self.dockerDriver, image_name,
+            #                                                                           temp_dir, dependencies))
+            #dependencies_thread.start()
 
             # Waiting for the threads
             malware_thread.join()
-            dependencies_thread.join()
+            vuln_thread.join()
+            #dependencies_thread.join()
 
         except Exception as ex:
             message = "Unexpected exception of type {0} occurred: {1!r}"\
@@ -117,8 +127,8 @@ class Analyzer:
 
         data['image_name'] = image_name
         data['timestamp'] = datetime.datetime.now().timestamp()
-        data['static_analysis'] = self.generate_static_analysis(image_name, os_packages, dependencies, malware_binaries)
-
+        #data['static_analysis'] = self.generate_static_analysis(image_name, os_packages, dependencies, malware_binaries)
+        data['static_analysis'] = self.generate_static_analysis(image_name, malware_binaries, vulnerabilities )
         if InternalServer.is_debug_logging_enabled():
             DagdaLogger.get_logger().debug('Analysis output completed')
 
@@ -128,12 +138,41 @@ class Analyzer:
 
         return data
 
-    # Generates the result of the static analysis
-    def generate_static_analysis(self, image_name, os_packages, dependencies, malware_binaries):
+    # Generates the result of the static analysis os_packages, dependencies,
+    def generate_static_analysis(self, image_name,  malware_binaries, klar_output):
         data = {}
-        data['os_packages'] = self.generate_os_report(image_name, os_packages)
-        data['prog_lang_dependencies'] = self.generate_dependencies_report(image_name, dependencies)
+        #data['os_packages'] = self.generate_os_report(image_name, os_packages)
+        #data['prog_lang_dependencies'] = self.generate_dependencies_report(image_name, dependencies)
         data['malware_binaries'] = malware_binaries
+        if len(klar_output)>0:
+            vulns = klar_output[0]["Vulnerabilities"]
+            
+        
+            if vulns:
+                
+                vulns['criticalCount']=0
+                vulns['isCritical']=False
+                vulns['defcon1Count']= 0
+                vulns['highCount']=0
+                vulns['mediumCount']=0
+                vulns['lowCount']=0   
+                if 'Critical' in vulns:
+                    vulns['criticalCount']= len(vulns['Critical'])
+                    vulns['isCritical']=True 
+                if 'Defcon1' in vulns:
+                    vulns['defcon1Count']= len(vulns['Defcon1'])
+                    vulns['isCritical']=True
+                if 'High' in vulns:
+                    vulns['highCount']=len(vulns['High'])
+                if 'Medium' in vulns:
+                    vulns['mediumCount']= len(vulns['Medium'])
+                if 'Low' in vulns:
+                    vulns['lowCount'] = len(vulns['Low'])  
+                vulns['LayerCount']=klar_output[0]["LayerCount"]
+                
+                data['vulnerabilities']=vulns
+                
+        
         return data
 
     # Generates dependencies report
@@ -231,6 +270,21 @@ class Analyzer:
         if InternalServer.is_debug_logging_enabled():
             DagdaLogger.get_logger().debug('Malware files from the docker image retrieved')
 
+    # Get vulnerabilties from clair using klar tool
+    @staticmethod
+    def _threaded_klar( image_name, vulnerabilities):
+        if InternalServer.is_debug_logging_enabled():
+            DagdaLogger.get_logger().debug('Retrieving vulnerabilities report from klar ...')
+        
+        result = subprocess.run('/klar '+ image_name, executable='/bin/ash', shell=True, stdout=subprocess.PIPE)
+       
+        
+        #output=json.loads(result.stdout)
+        output= result.stdout.decode('utf-8');
+        vulnerabilities.append(json.loads(output))
+        if InternalServer.is_debug_logging_enabled():
+            DagdaLogger.get_logger().debug('vulnerabilities report from klar retreived ...')
+            DagdaLogger.get_logger().debug(' vulnerabilities generated:  '+output)
     # Get programming language dependencies thread
     @staticmethod
     def _threaded_dependencies(dockerDriver, image_name, temp_dir, dependencies):
